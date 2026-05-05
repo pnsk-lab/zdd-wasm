@@ -1,7 +1,7 @@
-use js_sys::{Array, BigUint64Array};
+use js_sys::{Array, BigUint64Array, Math};
 use std::{collections::HashMap, hash::Hash};
 
-use num_bigint::BigInt;
+use num_bigint::{BigInt, Sign};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -102,6 +102,18 @@ impl ZDD {
         }
 
         Ok(out.into())
+    }
+
+    pub fn sample(&self, root: NodeId) -> Result<JsValue, JsValue> {
+        self.validate_node(root)?;
+
+        let set = self
+            .inner
+            .sample(root)
+            .ok_or_else(|| JsValue::from_str("cannot sample from the empty family"))?;
+        let row = set.iter().map(|v| *v as u64).collect::<Vec<u64>>();
+
+        Ok(BigUint64Array::new_from_slice(&row).into())
     }
 
     pub fn node_count(&self) -> usize {
@@ -346,6 +358,92 @@ impl ZDDInner {
         let mut cache: HashMap<NodeId, BigInt> = HashMap::new();
         self.count_reccursive(&mut cache, root)
     }
+    fn bit_len(value: &BigInt) -> usize {
+        let (_, bytes) = value.to_bytes_be();
+        if bytes.is_empty() {
+            return 0;
+        }
+
+        (bytes.len() - 1) * 8 + (8 - bytes[0].leading_zeros() as usize)
+    }
+    fn random_bigint_less_than(upper: &BigInt) -> BigInt {
+        let bit_len = Self::bit_len(upper);
+        let byte_len = bit_len.div_ceil(8);
+        let excess_bits = byte_len * 8 - bit_len;
+
+        loop {
+            let mut bytes = (0..byte_len)
+                .map(|_| (Math::random() * 256.0).floor() as u8)
+                .collect::<Vec<u8>>();
+
+            if excess_bits > 0 {
+                bytes[0] &= 0xff >> excess_bits;
+            }
+
+            let candidate = BigInt::from_bytes_be(Sign::Plus, &bytes);
+            if candidate < *upper {
+                return candidate;
+            }
+        }
+    }
+    fn set_at_index_reccursive(
+        &self,
+        cache: &mut HashMap<NodeId, BigInt>,
+        id: NodeId,
+        index: BigInt,
+        acc: &mut Vec<VarId>,
+    ) -> bool {
+        if id == 0 {
+            return false;
+        }
+        if id == 1 {
+            return index == BigInt::from(0);
+        }
+
+        let n = self.nodes[id];
+        let lo_count = self.count_reccursive(cache, n.lo);
+
+        if index < lo_count {
+            return self.set_at_index_reccursive(cache, n.lo, index, acc);
+        }
+
+        acc.push(n.var);
+        let found = self.set_at_index_reccursive(cache, n.hi, index - lo_count, acc);
+        if !found {
+            acc.pop();
+        }
+        found
+    }
+    #[cfg(test)]
+    fn set_at_index(&self, root: NodeId, index: BigInt) -> Option<Vec<VarId>> {
+        let mut cache: HashMap<NodeId, BigInt> = HashMap::new();
+        let total = self.count_reccursive(&mut cache, root);
+        if index < BigInt::from(0) || index >= total {
+            return None;
+        }
+
+        let mut result = vec![];
+        if self.set_at_index_reccursive(&mut cache, root, index, &mut result) {
+            Some(result)
+        } else {
+            None
+        }
+    }
+    pub fn sample(&self, root: NodeId) -> Option<Vec<VarId>> {
+        let mut cache: HashMap<NodeId, BigInt> = HashMap::new();
+        let total = self.count_reccursive(&mut cache, root);
+        if total == BigInt::from(0) {
+            return None;
+        }
+
+        let index = Self::random_bigint_less_than(&total);
+        let mut result = vec![];
+        if self.set_at_index_reccursive(&mut cache, root, index, &mut result) {
+            Some(result)
+        } else {
+            None
+        }
+    }
     fn enumerate_reccursive(&self, result: &mut Vec<Vec<VarId>>, id: NodeId, acc: &mut Vec<VarId>) {
         if id == 0 {
             return;
@@ -371,5 +469,18 @@ impl ZDDInner {
 mod tests {
     use super::*;
     #[test]
-    fn sample() {}
+    fn set_at_index_matches_enumerate_order() {
+        let mut zdd = ZDDInner::new();
+        let a = zdd.singleton(1);
+        let b = zdd.singleton(2);
+        let ab = zdd.product(a, b);
+        let non_empty = zdd.apply(Op::Union, a, ab);
+        let root = zdd.apply(Op::Union, ZDDInner::empty_set(), non_empty);
+
+        assert_eq!(zdd.enumerate(root), vec![vec![], vec![1], vec![1, 2]]);
+        assert_eq!(zdd.set_at_index(root, BigInt::from(0)), Some(vec![]));
+        assert_eq!(zdd.set_at_index(root, BigInt::from(1)), Some(vec![1]));
+        assert_eq!(zdd.set_at_index(root, BigInt::from(2)), Some(vec![1, 2]));
+        assert_eq!(zdd.set_at_index(root, BigInt::from(3)), None);
+    }
 }
