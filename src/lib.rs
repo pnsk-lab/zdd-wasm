@@ -1,5 +1,5 @@
 use js_sys::{Array, BigUint64Array, Math};
-use std::{collections::BTreeMap, hash::Hash};
+use std::collections::HashMap;
 
 use num_bigint::{BigInt, Sign};
 use wasm_bindgen::prelude::*;
@@ -87,16 +87,10 @@ impl ZDD {
     pub fn enumerate(&self, root: NodeId) -> Result<JsValue, JsValue> {
         self.validate_node(root)?;
 
-        let family = self
-            .inner
-            .enumerate(root)
-            .iter()
-            .map(|f| f.iter().map(|f| *f as u64).collect::<Vec<u64>>())
-            .collect::<Vec<Vec<u64>>>();
-
         let out = Array::new();
 
-        for row in family {
+        for row in self.inner.enumerate(root) {
+            let row = row.iter().map(|v| *v as u64).collect::<Vec<u64>>();
             let typed = BigUint64Array::new_from_slice(&row);
             out.push(&typed.into());
         }
@@ -137,6 +131,12 @@ impl ZDD {
     }
 }
 
+impl Default for ZDD {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub type NodeId = usize;
 pub type VarId = usize;
 
@@ -147,16 +147,22 @@ pub struct Node {
     hi: NodeId,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Op {
     Union,
     Intersect,
     Diff,
 }
+impl Op {
+    fn is_commutative(self) -> bool {
+        matches!(self, Op::Union | Op::Intersect)
+    }
+}
+
 struct ZDDInner {
     nodes: Vec<Node>,
-    unique: BTreeMap<(VarId, NodeId, NodeId), NodeId>,
-    apply_cache: BTreeMap<(Op, NodeId, NodeId), NodeId>,
+    unique: HashMap<(VarId, NodeId, NodeId), NodeId>,
+    apply_cache: HashMap<(Op, NodeId, NodeId), NodeId>,
 }
 impl ZDDInner {
     pub fn new() -> Self {
@@ -173,18 +179,15 @@ impl ZDDInner {
                     hi: 1,
                 },
             ],
-            unique: BTreeMap::new(),
-            apply_cache: BTreeMap::new(),
+            unique: HashMap::new(),
+            apply_cache: HashMap::new(),
         }
     }
     pub fn zero() -> NodeId {
-        return 0;
+        0
     }
     pub fn one() -> NodeId {
-        return 1;
-    }
-    pub fn node(&self, id: NodeId) -> &Node {
-        &self.nodes[id]
+        1
     }
     fn make(&mut self, var_id: VarId, lo: NodeId, hi: NodeId) -> NodeId {
         if hi == 0 {
@@ -232,15 +235,23 @@ impl ZDDInner {
             if n.var == v { n.hi } else { 0 }
         }
     }
+    fn apply_cache_key(op: Op, a: NodeId, b: NodeId) -> (Op, NodeId, NodeId) {
+        if op.is_commutative() && a > b {
+            (op, b, a)
+        } else {
+            (op, a, b)
+        }
+    }
+
     pub fn apply(&mut self, op: Op, a: NodeId, b: NodeId) -> NodeId {
-        let cached = self.apply_cache.get(&(op, a, b));
-        if let Some(cached) = cached {
-            return *cached;
-        };
         let terminal = Self::apply_terminal(op, a, b);
         if let Some(terminal) = terminal {
-            self.apply_cache.insert((op, a, b), terminal);
             return terminal;
+        };
+        let key = Self::apply_cache_key(op, a, b);
+        let cached = self.apply_cache.get(&key);
+        if let Some(cached) = cached {
+            return *cached;
         };
         let v = VarId::min(self.var_of(a), self.var_of(b));
         let a0 = self.lo(a, v);
@@ -250,7 +261,7 @@ impl ZDDInner {
         let lo = self.apply(op, a0, b0);
         let hi = self.apply(op, a1, b1);
         let result = self.make(v, lo, hi);
-        self.apply_cache.insert((op, a, b), result);
+        self.apply_cache.insert(key, result);
         result
     }
     fn apply_terminal(op: Op, a: NodeId, b: NodeId) -> Option<NodeId> {
@@ -265,7 +276,7 @@ impl ZDDInner {
                 if a == b {
                     return Some(a);
                 };
-                return None;
+                None
             }
             Op::Intersect => {
                 if a == 0 || b == 0 {
@@ -277,7 +288,7 @@ impl ZDDInner {
                 if a == 1 && b == 1 {
                     return Some(1);
                 };
-                return None;
+                None
             }
             Op::Diff => {
                 if a == 0 {
@@ -289,7 +300,7 @@ impl ZDDInner {
                 if a == b {
                     return Some(0);
                 };
-                return None;
+                None
             }
         }
     }
@@ -298,7 +309,7 @@ impl ZDDInner {
     }
     fn product_reccursice(
         &mut self,
-        cache: &mut BTreeMap<(NodeId, NodeId), NodeId>,
+        cache: &mut HashMap<(NodeId, NodeId), NodeId>,
         x: NodeId,
         y: NodeId,
     ) -> NodeId {
@@ -311,7 +322,8 @@ impl ZDDInner {
         if y == 1 {
             return x;
         };
-        let cached = cache.get(&(x, y));
+        let key = if x > y { (y, x) } else { (x, y) };
+        let cached = cache.get(&key);
         if let Some(cached) = cached {
             return *cached;
         };
@@ -329,14 +341,14 @@ impl ZDDInner {
         let hi_left = self.apply(Op::Union, x1y0, x0y1);
         let hi = self.apply(Op::Union, hi_left, x1y1);
         let result = self.make(v, lo, hi);
-        cache.insert((x, y), result);
+        cache.insert(key, result);
         result
     }
     pub fn product(&mut self, a: NodeId, b: NodeId) -> NodeId {
-        let mut cache: BTreeMap<(NodeId, NodeId), NodeId> = BTreeMap::new();
+        let mut cache: HashMap<(NodeId, NodeId), NodeId> = HashMap::new();
         self.product_reccursice(&mut cache, a, b)
     }
-    pub fn count_reccursive(&self, cache: &mut BTreeMap<NodeId, BigInt>, id: NodeId) -> BigInt {
+    pub fn count_reccursive(&self, cache: &mut HashMap<NodeId, BigInt>, id: NodeId) -> BigInt {
         if id == 0 {
             return BigInt::from(0);
         };
@@ -355,7 +367,7 @@ impl ZDDInner {
         res
     }
     pub fn count(&self, root: NodeId) -> BigInt {
-        let mut cache: BTreeMap<NodeId, BigInt> = BTreeMap::new();
+        let mut cache: HashMap<NodeId, BigInt> = HashMap::new();
         self.count_reccursive(&mut cache, root)
     }
     fn bit_len(value: &BigInt) -> usize {
@@ -388,7 +400,7 @@ impl ZDDInner {
     }
     fn set_at_index_reccursive(
         &self,
-        cache: &mut BTreeMap<NodeId, BigInt>,
+        cache: &mut HashMap<NodeId, BigInt>,
         id: NodeId,
         index: BigInt,
         acc: &mut Vec<VarId>,
@@ -416,7 +428,7 @@ impl ZDDInner {
     }
     #[cfg(test)]
     fn set_at_index(&self, root: NodeId, index: BigInt) -> Option<Vec<VarId>> {
-        let mut cache: BTreeMap<NodeId, BigInt> = BTreeMap::new();
+        let mut cache: HashMap<NodeId, BigInt> = HashMap::new();
         let total = self.count_reccursive(&mut cache, root);
         if index < BigInt::from(0) || index >= total {
             return None;
@@ -430,7 +442,7 @@ impl ZDDInner {
         }
     }
     pub fn sample(&self, root: NodeId) -> Option<Vec<VarId>> {
-        let mut cache: BTreeMap<NodeId, BigInt> = BTreeMap::new();
+        let mut cache: HashMap<NodeId, BigInt> = HashMap::new();
         let total = self.count_reccursive(&mut cache, root);
         if total == BigInt::from(0) {
             return None;
