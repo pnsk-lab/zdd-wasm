@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "zdd-wasm"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "js-sys",
  "num-bigint",
